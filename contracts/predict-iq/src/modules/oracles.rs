@@ -1,7 +1,8 @@
 use crate::errors::ErrorCode;
 use crate::types::OracleConfig;
-use soroban_sdk::{contracttype, Env, Symbol};
-use soroban_sdk::{contracttype, symbol_short, Env, Symbol};
+use soroban_sdk::{contracttype, symbol_short, Env};
+
+const BPS_DENOMINATOR: u64 = 10_000;
 
 /// Issue #9: Key now includes oracle_id to support multi-oracle aggregation.
 #[contracttype]
@@ -145,4 +146,20 @@ pub fn set_oracle_result(e: &Env, market_id: u64, outcome: u32) -> Result<(), Er
 
 pub fn verify_oracle_health(_e: &Env, config: &OracleConfig) -> bool {
     !config.feed_id.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::abs_price_to_u64;
+
+    #[test]
+    fn abs_price_handles_i64_min_without_panic() {
+        assert_eq!(abs_price_to_u64(i64::MIN), i64::MAX as u64);
+    }
+
+    #[test]
+    fn abs_price_preserves_normal_values() {
+        assert_eq!(abs_price_to_u64(-123), 123);
+        assert_eq!(abs_price_to_u64(456), 456);
+    }
 }
