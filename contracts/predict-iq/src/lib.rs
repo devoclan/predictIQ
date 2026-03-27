@@ -10,6 +10,8 @@ mod query_tests;
 mod test_tie_handling;
 #[cfg(test)]
 mod test_payout_mode_immutability;
+#[cfg(test)]
+mod test_oracle_overflow;
 pub mod types;
 
 pub use errors::ErrorCode;

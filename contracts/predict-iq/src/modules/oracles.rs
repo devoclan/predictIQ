@@ -124,8 +124,12 @@ pub fn validate_price(e: &Env, price: &PythPrice, config: &OracleConfig) -> Resu
     }
 
     // Issue #41: use abs_price_to_u64 to safely handle i64::MIN.
+    // Use u128 arithmetic to prevent overflow when price_abs * max_confidence_bps
+    // exceeds u64::MAX (e.g. price_abs = i64::MAX as u64, bps = 10_000).
     let price_abs = abs_price_to_u64(price.price);
-    let max_conf = (price_abs * config.max_confidence_bps) / BPS_DENOMINATOR;
+    let max_conf = ((price_abs as u128 * config.max_confidence_bps as u128)
+        / BPS_DENOMINATOR as u128)
+        .min(u64::MAX as u128) as u64;
 
     if price.conf > max_conf {
         return Err(ErrorCode::ConfidenceTooLow);
