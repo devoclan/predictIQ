@@ -8,6 +8,12 @@ const DISPUTE_WINDOW_SECONDS: u64 = 172_800; // 48 hours
 const VOTING_PERIOD_SECONDS: u64 = 259_200;  // 72 hours
 const MAJORITY_THRESHOLD_BPS: i128 = 6000;   // 60%
 
+/// Returns the active dispute window in seconds.
+/// Issue #7: Used by claim_creation_deposit to enforce the finality lock.
+pub fn get_dispute_window(_e: &Env) -> u64 {
+    DISPUTE_WINDOW_SECONDS
+}
+
 pub fn attempt_oracle_resolution(e: &Env, market_id: u64) -> Result<(), ErrorCode> {
     let mut market = markets::get_market(e, market_id).ok_or(ErrorCode::MarketNotFound)?;
 
