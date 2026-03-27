@@ -1,5 +1,9 @@
 #![cfg(test)]
 use crate::errors::ErrorCode;
+use crate::types::{MarketStatus, MarketTier, OracleConfig};
+use crate::{PredictIQ, PredictIQClient};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
 use crate::types::{Market, MarketStatus, MarketTier, OracleConfig};
 use crate::{PredictIQ, PredictIQClient};
 use soroban_sdk::{
@@ -11,7 +15,7 @@ fn setup_test_with_token() -> (Env, PredictIQClient<'static>, Address, Address, 
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register_contract(None, PredictIQ);
+    let contract_id = env.register(PredictIQ, ());
     let client = PredictIQClient::new(&env, &contract_id);
 
     let admin = Address::generate(&env);
@@ -36,10 +40,7 @@ fn create_simple_market(
 ) -> u64 {
     let options = Vec::from_array(
         env,
-        [
-            String::from_str(env, "Yes"),
-            String::from_str(env, "No"),
-        ],
+        [String::from_str(env, "Yes"), String::from_str(env, "No")],
     );
 
     let oracle_config = OracleConfig {
@@ -47,6 +48,7 @@ fn create_simple_market(
         feed_id: String::from_str(env, "test"),
         min_responses: Some(1),
         max_staleness_seconds: 3600,
+        max_confidence_bps: 200,
         max_confidence_bps: 100,
     };
 
@@ -226,7 +228,7 @@ fn test_claim_winnings_success() {
     // Resolve market with outcome 0 (user wins)
     client.resolve_market(&market_id, &0);
 
-    let result = client.try_claim_winnings(&user, &market_id, &token);
+    let result = client.try_claim_winnings(&user, &market_id);
     assert!(result.is_ok());
 }
 
@@ -243,7 +245,7 @@ fn test_claim_winnings_losing_bet() {
     // Resolve market with outcome 1 (user loses)
     client.resolve_market(&market_id, &1);
 
-    let result = client.try_claim_winnings(&user, &market_id, &token);
+    let result = client.try_claim_winnings(&user, &market_id);
     assert_eq!(result, Err(Ok(ErrorCode::NoWinnings)));
 }
 
@@ -257,7 +259,7 @@ fn test_claim_winnings_before_resolution() {
 
     client.place_bet(&user, &market_id, &0, &1000, &token, &None);
 
-    let result = client.try_claim_winnings(&user, &market_id, &token);
+    let result = client.try_claim_winnings(&user, &market_id);
     assert_eq!(result, Err(Ok(ErrorCode::MarketNotResolved)));
 }
 
@@ -272,24 +274,25 @@ fn test_claim_winnings_twice() {
     client.place_bet(&user, &market_id, &0, &1000, &token, &None);
     client.resolve_market(&market_id, &0);
 
-    client.claim_winnings(&user, &market_id, &token);
+    client.claim_winnings(&user, &market_id);
 
     // Second claim should fail
-    let result = client.try_claim_winnings(&user, &market_id, &token);
+    let result = client.try_claim_winnings(&user, &market_id);
     assert_eq!(result, Err(Ok(ErrorCode::AlreadyClaimed)));
 }
 
 #[test]
 fn test_claim_winnings_no_bet_placed() {
-    let (env, client, _admin, user, token) = setup_test_with_token();
+    let (env, client, _admin, _user, _token) = setup_test_with_token();
 
     env.ledger().set_timestamp(500);
 
-    let market_id = create_simple_market(&client, &env, &user, &token);
+    let other_user = Address::generate(&env);
+    let market_id = create_simple_market(&client, &env, &other_user, &_token);
 
     client.resolve_market(&market_id, &0);
 
-    let result = client.try_claim_winnings(&user, &market_id, &token);
+    let result = client.try_claim_winnings(&other_user, &market_id);
     assert_eq!(result, Err(Ok(ErrorCode::NoWinnings)));
 }
 
@@ -298,8 +301,8 @@ fn test_winnings_calculation_single_winner() {
     let (env, client, _admin, user1, token) = setup_test_with_token();
 
     let user2 = Address::generate(&env);
-    let token_client = token::StellarAssetClient::new(&env, &token);
-    token_client.mint(&user2, &100_000);
+    let token_client = token::Client::new(&env, &token);
+    token::StellarAssetClient::new(&env, &token).mint(&user2, &100_000);
 
     env.ledger().set_timestamp(500);
 
@@ -314,6 +317,9 @@ fn test_winnings_calculation_single_winner() {
     // Resolve with outcome 0 (user1 wins)
     client.resolve_market(&market_id, &0);
 
+    let balance_before = token_client.balance(&user1);
+    let winnings = client.claim_winnings(&user1, &market_id);
+    let balance_after = token_client.balance(&user1);
     let balance_before = token::Client::new(&env, &token).balance(&user1);
     let winnings = client.claim_winnings(&user1, &market_id, &token);
     let balance_after = token::Client::new(&env, &token).balance(&user1);
@@ -329,9 +335,9 @@ fn test_winnings_calculation_multiple_winners() {
 
     let user2 = Address::generate(&env);
     let user3 = Address::generate(&env);
-    let token_client = token::StellarAssetClient::new(&env, &token);
-    token_client.mint(&user2, &100_000);
-    token_client.mint(&user3, &100_000);
+    let sac = token::StellarAssetClient::new(&env, &token);
+    sac.mint(&user2, &100_000);
+    sac.mint(&user3, &100_000);
 
     env.ledger().set_timestamp(500);
 
@@ -347,8 +353,8 @@ fn test_winnings_calculation_multiple_winners() {
     // Resolve with outcome 0
     client.resolve_market(&market_id, &0);
 
-    let winnings1 = client.claim_winnings(&user1, &market_id, &token);
-    let winnings2 = client.claim_winnings(&user2, &market_id, &token);
+    let winnings1 = client.claim_winnings(&user1, &market_id);
+    let winnings2 = client.claim_winnings(&user2, &market_id);
 
     // User2 bet twice as much, should get twice the winnings
     assert!(winnings2 > winnings1);
@@ -367,7 +373,14 @@ fn test_referral_rewards_tracked() {
     let market_id = create_simple_market(&client, &env, &user, &token);
 
     // Place bet with referrer
-    client.place_bet(&user, &market_id, &0, &1000, &token, &Some(referrer.clone()));
+    client.place_bet(
+        &user,
+        &market_id,
+        &0,
+        &1000,
+        &token,
+        &Some(referrer.clone()),
+    );
 
     // Referrer should have pending rewards
     let rewards = client.try_claim_referral_rewards(&referrer, &token);
@@ -402,8 +415,8 @@ fn test_withdraw_refund_clears_bet_record() {
 
     // Cancel the market
     client.resolve_market(&market_id, &0); // resolve first so we can test via admin cancel path
-    // Use admin cancel instead
-    // Re-create a fresh market for the cancel path
+                                           // Use admin cancel instead
+                                           // Re-create a fresh market for the cancel path
     let market_id2 = create_simple_market(&client, &env, &user, &token);
     client.place_bet(&user, &market_id2, &0, &2000, &token, &None);
     client.cancel_market_admin(&market_id2);
@@ -472,29 +485,169 @@ fn test_bet_key_is_unique_per_outcome() {
     assert_eq!(refund1, 300);
 }
 
-#[test]
-fn test_bet_counter_accuracy() {
-    let (env, client, _admin, user, token) = setup_test_with_token();
+// =============================================================================
+// Issue #24: Precise winner counter tests
+// =============================================================================
 
+#[test]
+fn test_winner_count_increments_on_first_bet() {
+    let (env, client, _admin, user, token) = setup_test_with_token();
     env.ledger().set_timestamp(500);
 
     let market_id = create_simple_market(&client, &env, &user, &token);
 
-    // Place 105 bets on outcome 0 to verify >100 requirement
-    for _ in 0..105 {
-        client.place_bet(&user, &market_id, &0, &1000, &token, &None);
+    client.place_bet(&user, &market_id, &0, &1, &token, &None);
+
+    let market = client.get_market(&market_id).unwrap();
+    assert_eq!(
+        market.winner_counts.get(0).unwrap_or(0),
+        1,
+        "First bet on outcome 0 should set winner_counts[0] = 1"
+    );
+}
+
+#[test]
+fn test_winner_count_not_incremented_on_repeat_bet() {
+    let (env, client, _admin, user, token) = setup_test_with_token();
+    env.ledger().set_timestamp(500);
+
+    let market_id = create_simple_market(&client, &env, &user, &token);
+
+    // Same bettor bets twice on the same outcome
+    client.place_bet(&user, &market_id, &0, &1, &token, &None);
+    client.place_bet(&user, &market_id, &0, &1, &token, &None);
+
+    let market = client.get_market(&market_id).unwrap();
+    assert_eq!(
+        market.winner_counts.get(0).unwrap_or(0),
+        1,
+        "Repeat bet by same bettor must not increment winner_counts"
+    );
+}
+
+#[test]
+fn test_winner_count_independent_per_outcome() {
+    let (env, client, _admin, user, token) = setup_test_with_token();
+    env.ledger().set_timestamp(500);
+
+    let market_id = create_simple_market(&client, &env, &user, &token);
+
+    client.place_bet(&user, &market_id, &0, &1, &token, &None);
+    client.place_bet(&user, &market_id, &1, &1, &token, &None);
+
+    let market = client.get_market(&market_id).unwrap();
+    assert_eq!(market.winner_counts.get(0).unwrap_or(0), 1);
+    assert_eq!(market.winner_counts.get(1).unwrap_or(0), 1);
+}
+
+#[test]
+fn test_winner_count_multiple_unique_bettors() {
+    let (env, client, _admin, user1, token) = setup_test_with_token();
+
+    let user2 = Address::generate(&env);
+    let user3 = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token).mint(&user2, &100_000);
+    token::StellarAssetClient::new(&env, &token).mint(&user3, &100_000);
+
+    env.ledger().set_timestamp(500);
+    let market_id = create_simple_market(&client, &env, &user1, &token);
+
+    client.place_bet(&user1, &market_id, &0, &1, &token, &None);
+    client.place_bet(&user2, &market_id, &0, &1, &token, &None);
+    client.place_bet(&user3, &market_id, &0, &1, &token, &None);
+
+    let market = client.get_market(&market_id).unwrap();
+    assert_eq!(
+        market.winner_counts.get(0).unwrap_or(0),
+        3,
+        "Three unique bettors on outcome 0 should yield winner_counts[0] = 3"
+    );
+}
+
+#[test]
+fn test_resolve_market_uses_precise_count_for_push_mode() {
+    let (env, client, _admin, user, token) = setup_test_with_token();
+    env.ledger().set_timestamp(500);
+
+    let market_id = create_simple_market(&client, &env, &user, &token);
+
+    // Place a single bet — winner_counts[0] = 1, well below default threshold of 50
+    client.place_bet(&user, &market_id, &0, &1, &token, &None);
+    client.resolve_market(&market_id, &0);
+
+    let market = client.get_market(&market_id).unwrap();
+    assert_eq!(
+        market.payout_mode,
+        crate::types::PayoutMode::Push,
+        "1 winner is below threshold — should select Push mode"
+    );
+}
+
+#[test]
+fn test_resolve_market_switches_to_pull_when_winners_exceed_threshold() {
+    let (env, client, _admin, user1, token) = setup_test_with_token();
+    env.ledger().set_timestamp(500);
+
+    let market_id = create_simple_market(&client, &env, &user1, &token);
+
+    // Lower threshold to 2 so we can test overflow with a small number of bettors
+    client.set_max_push_payout_winners(&2);
+
+    // 3 unique bettors on outcome 0 — exceeds threshold of 2
+    let sac = token::StellarAssetClient::new(&env, &token);
+    for _ in 0..3 {
+        let u = Address::generate(&env);
+        sac.mint(&u, &100_000);
+        client.place_bet(&u, &market_id, &0, &1, &token, &None);
     }
 
-    // Verify the count is 105
-    let count = client.count_bets_for_outcome(&market_id, &0);
-    assert_eq!(count, 105);
+    client.resolve_market(&market_id, &0);
 
-    // Place 50 bets on outcome 1
-    for _ in 0..50 {
-        client.place_bet(&user, &market_id, &1, &1000, &token, &None);
+    let market = client.get_market(&market_id).unwrap();
+    assert_eq!(
+        market.payout_mode,
+        crate::types::PayoutMode::Pull,
+        "3 winners exceeds threshold of 2 — should select Pull mode"
+    );
+}
+
+/// Regression test: with the old tally/100 heuristic, 10,000 micro-bets of 1 unit
+/// each would produce tally=10,000 → estimated_winners = 100, which exceeds the
+/// default threshold of 50 and correctly selects Pull. But if the average bet were
+/// 200 units (tally=2,000,000), the heuristic gives 20,000 estimated winners —
+/// wildly wrong. The precise counter always gives the exact unique bettor count.
+#[test]
+fn test_micro_bets_precise_count_prevents_gas_overflow() {
+    let (env, client, _admin, user1, token) = setup_test_with_token();
+    env.ledger().set_timestamp(500);
+
+    let market_id = create_simple_market(&client, &env, &user1, &token);
+
+    // Set threshold to 50 (default)
+    client.set_max_push_payout_winners(&50);
+
+    let sac = token::StellarAssetClient::new(&env, &token);
+
+    // 60 unique bettors each placing 1-unit bets (micro-bets)
+    for _ in 0..60 {
+        let u = Address::generate(&env);
+        sac.mint(&u, &100_000);
+        client.place_bet(&u, &market_id, &0, &1, &token, &None);
     }
 
-    // Verify outcome 0 is still 105 and outcome 1 is 50
-    assert_eq!(client.count_bets_for_outcome(&market_id, &0), 105);
-    assert_eq!(client.count_bets_for_outcome(&market_id, &1), 50);
+    let market = client.get_market(&market_id).unwrap();
+    assert_eq!(
+        market.winner_counts.get(0).unwrap_or(0),
+        60,
+        "Precise counter must reflect all 60 unique bettors"
+    );
+
+    client.resolve_market(&market_id, &0);
+
+    let resolved = client.get_market(&market_id).unwrap();
+    assert_eq!(
+        resolved.payout_mode,
+        crate::types::PayoutMode::Pull,
+        "60 winners > threshold 50 — must select Pull to avoid gas overflow"
+    );
 }

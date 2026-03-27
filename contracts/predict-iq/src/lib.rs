@@ -1,34 +1,52 @@
 #![cfg_attr(not(test), no_std)]
 use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, String, Vec};
 
-mod errors;
+pub mod errors;
 mod modules;
 mod test;
 #[cfg(test)]
 mod query_tests;
+#[cfg(test)]
+mod test_tie_handling;
+#[cfg(test)]
+mod test_payout_mode_immutability;
 pub mod types;
 
 pub use errors::ErrorCode;
 
 use crate::modules::admin;
-use crate::types::{CircuitBreakerState, ConfigKey};
+use crate::types::{CircuitBreakerState, ConfigKey, Guardian, UpgradeStats};
 
 #[contract]
 pub struct PredictIQ;
 
 #[contractimpl]
 impl PredictIQ {
-    pub fn initialize(e: Env, admin: Address, base_fee: i128) -> Result<(), ErrorCode> {
+    pub fn initialize(
+        e: Env,
+        admin: Address,
+        base_fee: i128,
+        guardians: Vec<crate::types::Guardian>,
+    ) -> Result<(), ErrorCode> {
+        // Require the deployer's authorization to prevent front-running attacks.
+        // Only the account that deployed this contract can call initialize.
+        e.deployer().require_auth();
+
         if e.storage().persistent().has(&ConfigKey::Admin) {
             return Err(ErrorCode::AlreadyInitialized);
         }
 
+        if guardians.is_empty() {
+            return Err(ErrorCode::NotAuthorized);
+        }
+
         admin::set_admin(&e, admin);
         e.storage().persistent().set(&ConfigKey::BaseFee, &base_fee);
-        e.storage().persistent().set(
+        e.storage().instance().set(
             &ConfigKey::CircuitBreakerState,
             &CircuitBreakerState::Closed,
         );
+        crate::modules::governance::initialize_guardians(&e, guardians)?;
         Ok(())
     }
 
@@ -84,6 +102,16 @@ impl PredictIQ {
         )
     }
 
+    pub fn claim_winnings(e: Env, bettor: Address, market_id: u64) -> Result<i128, ErrorCode> {
+        crate::modules::bets::claim_winnings(&e, bettor, market_id)
+    }
+
+    pub fn withdraw_refund(e: Env, bettor: Address, market_id: u64) -> Result<i128, ErrorCode> {
+        crate::modules::cancellation::withdraw_refund(&e, bettor, market_id)
+    }
+
+    pub fn cancel_market_admin(e: Env, market_id: u64) -> Result<(), ErrorCode> {
+        crate::modules::cancellation::cancel_market_admin(&e, market_id)
     pub fn claim_winnings(
         e: Env,
         bettor: Address,
@@ -122,6 +150,10 @@ impl PredictIQ {
         crate::modules::voting::cast_vote(&e, voter, market_id, outcome, weight)
     }
 
+    pub fn unlock_tokens(e: Env, voter: Address, market_id: u64) -> Result<(), ErrorCode> {
+        crate::modules::voting::unlock_tokens(&e, voter, market_id)
+    }
+
     pub fn file_dispute(e: Env, disciplinarian: Address, market_id: u64) -> Result<(), ErrorCode> {
         crate::modules::circuit_breaker::require_closed(&e)?;
         crate::modules::disputes::file_dispute(&e, disciplinarian, market_id)
@@ -142,8 +174,25 @@ impl PredictIQ {
         crate::modules::fees::get_base_fee(&e)
     }
 
+    pub fn set_fee_admin(e: Env, fee_admin: Address) -> Result<(), ErrorCode> {
+        crate::modules::admin::set_fee_admin(&e, fee_admin)
+    }
+
+    pub fn get_fee_admin(e: Env) -> Option<Address> {
+        crate::modules::admin::get_fee_admin(&e)
+    }
+
     pub fn get_revenue(e: Env, token: Address) -> i128 {
         crate::modules::fees::get_revenue(&e, token)
+    }
+
+    /// Issue #26: Withdraw accumulated protocol fees to a recipient.
+    pub fn withdraw_protocol_fees(
+        e: Env,
+        token: Address,
+        recipient: Address,
+    ) -> Result<i128, ErrorCode> {
+        crate::modules::fees::withdraw_protocol_fees(&e, &token, &recipient)
     }
 
     pub fn claim_referral_rewards(
@@ -162,6 +211,32 @@ impl PredictIQ {
     pub fn resolve_market(e: Env, market_id: u64, winning_outcome: u32) -> Result<(), ErrorCode> {
         crate::modules::admin::require_admin(&e)?;
         crate::modules::disputes::resolve_market(&e, market_id, winning_outcome)
+    }
+
+    pub fn attempt_oracle_resolution(e: Env, market_id: u64) -> Result<(), ErrorCode> {
+        crate::modules::resolution::attempt_oracle_resolution(&e, market_id)
+    }
+
+    pub fn finalize_resolution(e: Env, market_id: u64) -> Result<(), ErrorCode> {
+        crate::modules::resolution::finalize_resolution(&e, market_id)
+    }
+
+    /// Issue #63: Administrative fallback for disputed markets that failed to
+    /// reach the 60% community majority threshold after the full voting period.
+    ///
+    /// Only callable by the master admin. Enforces that:
+    ///   - The market is still Disputed (not already resolved).
+    ///   - The 72-hour voting window has fully elapsed.
+    ///   - Community voting genuinely deadlocked (NoMajorityReached).
+    ///
+    /// This ensures user capital is never permanently orphaned while keeping
+    /// the community-first resolution path intact.
+    pub fn admin_fallback_resolution(
+        e: Env,
+        market_id: u64,
+        winning_outcome: u32,
+    ) -> Result<(), ErrorCode> {
+        crate::modules::resolution::admin_fallback_resolution(&e, market_id, winning_outcome)
     }
 
     pub fn reset_monitoring(e: Env) -> Result<(), ErrorCode> {
@@ -184,6 +259,10 @@ impl PredictIQ {
 
     pub fn unpause(e: Env) -> Result<(), ErrorCode> {
         crate::modules::circuit_breaker::unpause(&e)
+    }
+
+    pub fn set_governance_token(e: Env, token: Address) -> Result<(), ErrorCode> {
+        crate::modules::admin::set_governance_token(&e, token)
     }
 
     pub fn get_resolution_metrics(
@@ -231,20 +310,16 @@ impl PredictIQ {
     }
 
     // Governance and Upgrade Functions
-    pub fn initialize_guardians(
-        e: Env,
-        guardians: Vec<crate::types::Guardian>,
-    ) -> Result<(), ErrorCode> {
-        crate::modules::admin::require_admin(&e)?;
-        crate::modules::governance::initialize_guardians(&e, guardians)
-    }
-
     pub fn add_guardian(e: Env, guardian: crate::types::Guardian) -> Result<(), ErrorCode> {
         crate::modules::governance::add_guardian(&e, guardian)
     }
 
     pub fn remove_guardian(e: Env, address: Address) -> Result<(), ErrorCode> {
         crate::modules::governance::remove_guardian(&e, address)
+    }
+
+    pub fn vote_on_guardian_removal(e: Env, voter: Address, approve: bool) -> Result<(), ErrorCode> {
+        crate::modules::governance::vote_on_guardian_removal(&e, voter, approve)
     }
 
     pub fn get_guardians(e: Env) -> Vec<crate::types::Guardian> {
@@ -267,7 +342,8 @@ impl PredictIQ {
         crate::modules::governance::get_pending_upgrade(&e)
     }
 
-    pub fn get_upgrade_votes(e: Env) -> Result<(u32, u32), ErrorCode> {
+    /// Issue #33: Returns named UpgradeStats struct.
+    pub fn get_upgrade_votes(e: Env) -> Result<UpgradeStats, ErrorCode> {
         crate::modules::governance::get_upgrade_votes(&e)
     }
 
@@ -275,44 +351,32 @@ impl PredictIQ {
         crate::modules::governance::is_timelock_satisfied(&e)
     }
 
-    /// Prune (archive) a resolved market after 30 days grace period
+    /// Issue #13: Configurable timelock duration.
+    pub fn set_timelock_duration(e: Env, seconds: u64) -> Result<(), ErrorCode> {
+        crate::modules::governance::set_timelock_duration(&e, seconds)
+    }
+
+    /// Issue #13: Returns the currently active timelock duration in seconds.
+    pub fn get_timelock_duration(e: Env) -> u64 {
+        crate::modules::governance::get_timelock_duration(&e)
+    }
+
+    /// Issue #47: Permissionless prune after grace period.
     pub fn prune_market(e: Env, market_id: u64) -> Result<(), ErrorCode> {
         crate::modules::markets::prune_market(&e, market_id)
     }
 
-    /// Get the minimum bet amount threshold
     pub fn get_minimum_bet_amount(e: Env) -> i128 {
         crate::modules::bets::get_minimum_bet_amount(&e)
     }
 
-    /// Set the minimum bet amount threshold (admin only)
     pub fn set_minimum_bet_amount(e: Env, amount: i128) -> Result<(), ErrorCode> {
         crate::modules::bets::set_minimum_bet_amount(&e, amount)
     }
 
-    /// Paginated retrieval of markets
-    pub fn get_markets(e: Env, offset: u32, limit: u32) -> Vec<crate::types::Market> {
-        crate::modules::queries::get_markets(&e, offset, limit)
-    }
-
-    /// Paginated retrieval of markets by status
-    pub fn get_markets_by_status(
-        e: Env,
-        status: crate::types::MarketStatus,
-        offset: u32,
-        limit: u32,
-    ) -> Vec<crate::types::Market> {
-        crate::modules::queries::get_markets_by_status(&e, status, offset, limit)
-    }
-
-    /// Paginated retrieval of guardians
-    pub fn get_guardians_paginated(e: Env, offset: u32, limit: u32) -> Vec<crate::types::Guardian> {
-        crate::modules::queries::get_guardians_paginated(&e, offset, limit)
-    }
-
-    /// Paginated retrieval of archived (pruned) market IDs
-    pub fn get_archived_market_ids(e: Env, offset: u32, limit: u32) -> Vec<u64> {
-        crate::modules::event_archive::get_archived_market_ids(&e, offset, limit)
+    /// Emergency pause triggered by 2/3 Guardian majority (community panic override)
+    pub fn emergency_pause(e: Env, voter: Address) -> Result<(), ErrorCode> {
+        crate::modules::governance::emergency_pause(&e, voter)
     }
 
     /// Get the accurate bet count for a specific outcome (analytics)
