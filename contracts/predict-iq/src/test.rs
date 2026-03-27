@@ -844,6 +844,18 @@ fn test_set_timelock_duration_out_of_range_rejected() {
 }
 
 #[test]
+fn test_get_timelock_duration_default_and_updated() {
+    let (_e, _admin, _contract_id, client) = setup_test_env();
+
+    // Default should be 48 hours
+    assert_eq!(client.get_timelock_duration(), 48 * 3600);
+
+    // After update, reflects new value
+    client.set_timelock_duration(&(6 * 3600));
+    assert_eq!(client.get_timelock_duration(), 6 * 3600);
+}
+
+#[test]
 fn test_majority_vote_required() {
     let (e, admin, _contract_id, client) = setup_test_env();
 
