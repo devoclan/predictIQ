@@ -1,7 +1,9 @@
 use crate::errors::ErrorCode;
 use crate::types::{
     ConfigKey, Guardian, PendingUpgrade, MAJORITY_THRESHOLD_PERCENT, TIMELOCK_DURATION,
-    GOV_TTL_LOW_THRESHOLD, GOV_TTL_HIGH_THRESHOLD,
+    UPGRADE_COOLDOWN_DURATION,
+    ConfigKey, Guardian, PendingUpgrade, GOV_TTL_HIGH_THRESHOLD, GOV_TTL_LOW_THRESHOLD,
+    MAJORITY_THRESHOLD_PERCENT, TIMELOCK_DURATION,
 };
 use soroban_sdk::{Address, BytesN, Env, Vec};
 
@@ -60,30 +62,102 @@ pub fn add_guardian(e: &Env, guardian: Guardian) -> Result<(), ErrorCode> {
     Ok(())
 }
 
-/// Remove a guardian from the set. Only callable by admin.
+/// Remove a guardian from the set. Requires majority consensus from other guardians.
 pub fn remove_guardian(e: &Env, address: Address) -> Result<(), ErrorCode> {
     crate::modules::admin::require_admin(e)?;
 
     let guardians = get_guardians(e);
-    let mut new_guardians: Vec<Guardian> = Vec::new(e);
-
+    
+    // Check if guardian exists
     let mut found = false;
     for g in guardians.iter() {
-        if g.address != address {
-            new_guardians.push_back(g.clone());
-        } else {
+        if g.address == address {
             found = true;
+            break;
         }
     }
-
+    
     if !found {
         return Err(ErrorCode::GuardianNotSet);
     }
 
+    // Initiate removal proposal
+    let pending_removal = crate::types::PendingGuardianRemoval {
+        target_guardian: address.clone(),
+        initiated_at: e.ledger().timestamp(),
+        votes_for: Vec::new(e),
+    };
+
     e.storage()
         .persistent()
-        .set(&ConfigKey::GuardianSet, &new_guardians);
-    bump_gov_ttl(e, &ConfigKey::GuardianSet);
+        .set(&ConfigKey::PendingGuardianRemoval, &pending_removal);
+    bump_gov_ttl(e, &ConfigKey::PendingGuardianRemoval);
+    Ok(())
+}
+
+/// Vote on a pending guardian removal. Requires majority of other guardians.
+pub fn vote_on_guardian_removal(e: &Env, voter: Address, approve: bool) -> Result<(), ErrorCode> {
+    let guardians = get_guardians(e);
+    
+    // Verify voter is a guardian
+    let mut voter_is_guardian = false;
+    for g in guardians.iter() {
+        if g.address == voter {
+            voter_is_guardian = true;
+            break;
+        }
+    }
+    
+    if !voter_is_guardian {
+        return Err(ErrorCode::NotAuthorized);
+    }
+
+    let mut pending_removal = e.storage()
+        .persistent()
+        .get::<_, crate::types::PendingGuardianRemoval>(&ConfigKey::PendingGuardianRemoval)
+        .ok_or(ErrorCode::GuardianNotSet)?;
+
+    // Check if voter already voted
+    for v in pending_removal.votes_for.iter() {
+        if v == voter {
+            return Err(ErrorCode::AlreadyVotedOnUpgrade);
+        }
+    }
+
+    if approve {
+        pending_removal.votes_for.push_back(voter);
+    }
+
+    // Calculate if majority reached (excluding target guardian)
+    let other_guardians_count = guardians.len() as u32 - 1;
+    let votes_needed = (other_guardians_count * MAJORITY_THRESHOLD_PERCENT) / 100 + 1;
+    
+    if pending_removal.votes_for.len() as u32 >= votes_needed {
+        // Majority reached, execute removal
+        let mut new_guardians: Vec<Guardian> = Vec::new(e);
+        for g in guardians.iter() {
+            if g.address != pending_removal.target_guardian {
+                new_guardians.push_back(g.clone());
+            }
+        }
+
+        e.storage()
+            .persistent()
+            .set(&ConfigKey::GuardianSet, &new_guardians);
+        bump_gov_ttl(e, &ConfigKey::GuardianSet);
+        
+        // Clear pending removal
+        e.storage()
+            .persistent()
+            .remove(&ConfigKey::PendingGuardianRemoval);
+    } else {
+        // Update pending removal with new vote
+        e.storage()
+            .persistent()
+            .set(&ConfigKey::PendingGuardianRemoval, &pending_removal);
+        bump_gov_ttl(e, &ConfigKey::PendingGuardianRemoval);
+    }
+
     Ok(())
 }
 
@@ -91,6 +165,13 @@ pub fn remove_guardian(e: &Env, address: Address) -> Result<(), ErrorCode> {
 /// Starts a 48-hour timelock and requires majority vote to execute.
 pub fn initiate_upgrade(e: &Env, wasm_hash: BytesN<32>) -> Result<(), ErrorCode> {
     crate::modules::admin::require_admin(e)?;
+
+    // Validate WASM hash is not empty
+    if wasm_hash.is_empty() {
+        return Err(ErrorCode::InvalidWasmHash);
+    }
+
+    require_no_upgrade_collision(e, &wasm_hash)?;
 
     // Check if an upgrade is already pending
     if e.storage().persistent().has(&ConfigKey::PendingUpgrade) {
@@ -112,6 +193,43 @@ pub fn initiate_upgrade(e: &Env, wasm_hash: BytesN<32>) -> Result<(), ErrorCode>
         .set(&ConfigKey::PendingUpgrade, &pending_upgrade);
     bump_gov_ttl(e, &ConfigKey::PendingUpgrade);
     Ok(())
+}
+
+fn require_no_upgrade_collision(e: &Env, wasm_hash: &String) -> Result<(), ErrorCode> {
+    if let Some(pending_upgrade) = get_pending_upgrade(e) {
+        if pending_upgrade.wasm_hash == *wasm_hash {
+            return Err(ErrorCode::UpgradeAlreadyPending);
+        }
+    }
+
+    if let Some(rejected_at) = get_upgrade_rejected_at(e, wasm_hash) {
+        let current_time = e.ledger().timestamp();
+        let elapsed = current_time.saturating_sub(rejected_at);
+        if elapsed <= UPGRADE_COOLDOWN_DURATION {
+            return Err(ErrorCode::UpgradeHashInCooldown);
+        }
+    }
+
+    Ok(())
+}
+
+fn get_upgrade_rejected_at(e: &Env, wasm_hash: &String) -> Option<u64> {
+    e.storage()
+        .persistent()
+        .get(&ConfigKey::UpgradeRejectedAt(wasm_hash.clone()))
+}
+
+fn set_upgrade_rejected_at(e: &Env, wasm_hash: &String) {
+    e.storage().persistent().set(
+        &ConfigKey::UpgradeRejectedAt(wasm_hash.clone()),
+        &e.ledger().timestamp(),
+    );
+}
+
+fn clear_upgrade_rejected_at(e: &Env, wasm_hash: &String) {
+    e.storage()
+        .persistent()
+        .remove(&ConfigKey::UpgradeRejectedAt(wasm_hash.clone()));
 }
 
 /// Get the currently pending upgrade, if any.
@@ -223,6 +341,9 @@ pub fn execute_upgrade(e: &Env) -> Result<(), ErrorCode> {
 
     // Verify majority vote
     if !is_majority_met(e, &pending_upgrade) {
+        // A failed execution after the timelock is treated as a governance rejection.
+        set_upgrade_rejected_at(e, &pending_upgrade.wasm_hash);
+        e.storage().persistent().remove(&ConfigKey::PendingUpgrade);
         return Err(ErrorCode::InsufficientVotes);
     }
 
@@ -230,6 +351,7 @@ pub fn execute_upgrade(e: &Env) -> Result<(), ErrorCode> {
 
     // Clear pending upgrade
     e.storage().persistent().remove(&ConfigKey::PendingUpgrade);
+    clear_upgrade_rejected_at(e, &wasm_hash);
 
     // Execute host-level contract code upgrade.
     e.deployer().update_current_contract_wasm(wasm_hash);
@@ -238,10 +360,49 @@ pub fn execute_upgrade(e: &Env) -> Result<(), ErrorCode> {
 }
 
 /// Get vote statistics for the pending upgrade.
-pub fn get_upgrade_votes(e: &Env) -> Result<(u32, u32), ErrorCode> {
+pub fn get_upgrade_votes(e: &Env) -> Result<crate::types::UpgradeStats, ErrorCode> {
     let pending_upgrade = get_pending_upgrade(e).ok_or(ErrorCode::UpgradeNotInitiated)?;
-    Ok((
-        pending_upgrade.votes_for.len() as u32,
-        pending_upgrade.votes_against.len() as u32,
-    ))
+    Ok(crate::types::UpgradeStats {
+        votes_for: pending_upgrade.votes_for.len() as u32,
+        votes_against: pending_upgrade.votes_against.len() as u32,
+    })
+}
+
+/// Emergency pause triggered by 2/3 Guardian majority (community panic override)
+pub fn emergency_pause(e: &Env, voter: Address) -> Result<(), ErrorCode> {
+    voter.require_auth();
+
+    let guardians = get_guardians(e);
+    if guardians.is_empty() {
+        return Err(ErrorCode::NotAuthorized);
+    }
+
+    // Verify voter is a guardian
+    let mut voter_power: u32 = 0;
+    let mut total_power: u32 = 0;
+    for g in guardians.iter() {
+        total_power += g.voting_power;
+        if g.address == voter {
+            voter_power = g.voting_power;
+        }
+    }
+
+    if voter_power == 0 {
+        return Err(ErrorCode::NotAuthorized);
+    }
+
+    // Check if this guardian's vote alone meets 2/3 threshold
+    let threshold = (total_power * 2) / 3;
+    if voter_power < threshold {
+        return Err(ErrorCode::InsufficientVotes);
+    }
+
+    // Trigger emergency pause
+    e.storage().persistent().set(
+        &ConfigKey::CircuitBreakerState,
+        &crate::types::CircuitBreakerState::Paused,
+    );
+    bump_gov_ttl(e, &ConfigKey::CircuitBreakerState);
+
+    Ok(())
 }
