@@ -100,14 +100,12 @@ impl PredictIQ {
         crate::modules::bets::claim_winnings(&e, bettor, market_id)
     }
 
-    pub fn withdraw_refund(
-        e: Env,
-        bettor: Address,
-        market_id: u64,
-        outcome: u32,
-        token_address: Address,
-    ) -> Result<i128, ErrorCode> {
-        crate::modules::bets::withdraw_refund(&e, bettor, market_id, outcome, token_address)
+    pub fn withdraw_refund(e: Env, bettor: Address, market_id: u64) -> Result<i128, ErrorCode> {
+        crate::modules::cancellation::withdraw_refund(&e, bettor, market_id)
+    }
+
+    pub fn cancel_market_admin(e: Env, market_id: u64) -> Result<(), ErrorCode> {
+        crate::modules::cancellation::cancel_market_admin(&e, market_id)
     }
 
     pub fn cancel_market_admin(e: Env, market_id: u64) -> Result<(), ErrorCode> {
@@ -186,18 +184,31 @@ impl PredictIQ {
         crate::modules::fees::claim_referral_rewards(&e, &address, &token)
     }
 
-    pub fn set_oracle_result(e: Env, market_id: u64, outcome: u32) -> Result<(), ErrorCode> {
+    /// Issue #9: oracle_id parameter allows multiple oracle sources per market.
+    /// Use oracle_id = 0 for the primary/default oracle.
+    pub fn set_oracle_result(e: Env, market_id: u64, oracle_id: u32, outcome: u32) -> Result<(), ErrorCode> {
         crate::modules::admin::require_admin(&e)?;
-        crate::modules::oracles::set_oracle_result(&e, market_id, outcome)
+        crate::modules::oracles::set_oracle_result(&e, market_id, oracle_id, outcome)
+    }
+
+    /// Issue #9: Query the stored result for a specific (market_id, oracle_id) pair.
+    pub fn get_oracle_result(e: Env, market_id: u64, oracle_id: u32) -> Option<u32> {
+        crate::modules::oracles::get_oracle_result(&e, market_id, oracle_id)
+    }
+
+    /// Issue #9: Query the last-update timestamp for a specific (market_id, oracle_id) pair.
+    pub fn get_oracle_last_update(e: Env, market_id: u64, oracle_id: u32) -> Option<u64> {
+        crate::modules::oracles::get_last_update(&e, market_id, oracle_id)
+    }
+
+    /// Issue #9: Attempt oracle resolution using a specific oracle_id (default 0).
+    pub fn attempt_oracle_resolution(e: Env, market_id: u64) -> Result<(), ErrorCode> {
+        crate::modules::resolution::attempt_oracle_resolution(&e, market_id)
     }
 
     pub fn resolve_market(e: Env, market_id: u64, winning_outcome: u32) -> Result<(), ErrorCode> {
         crate::modules::admin::require_admin(&e)?;
         crate::modules::disputes::resolve_market(&e, market_id, winning_outcome)
-    }
-
-    pub fn attempt_oracle_resolution(e: Env, market_id: u64) -> Result<(), ErrorCode> {
-        crate::modules::resolution::attempt_oracle_resolution(&e, market_id)
     }
 
     pub fn finalize_resolution(e: Env, market_id: u64) -> Result<(), ErrorCode> {
@@ -342,6 +353,16 @@ impl PredictIQ {
     /// Issue #13: Returns the currently active timelock duration in seconds.
     pub fn get_timelock_duration(e: Env) -> u64 {
         crate::modules::governance::get_timelock_duration(&e)
+    }
+
+    /// Issue #8: Set the dispute window duration (admin-only, minimum 24h).
+    pub fn set_dispute_window(e: Env, seconds: u64) -> Result<(), ErrorCode> {
+        crate::modules::resolution::set_dispute_window(&e, seconds)
+    }
+
+    /// Issue #8: Get the active dispute window duration in seconds (default 72h).
+    pub fn get_dispute_window(e: Env) -> u64 {
+        crate::modules::resolution::get_dispute_window(&e)
     }
 
     /// Issue #47: Permissionless prune after grace period.

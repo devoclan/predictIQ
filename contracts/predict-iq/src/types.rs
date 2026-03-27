@@ -117,6 +117,8 @@ pub enum ConfigKey {
     MaxPushPayoutWinners,
     PendingGuardianRemoval,
     MinimumBetAmount,
+    /// Issue #8: Configurable dispute window duration in seconds.
+    DisputeWindow,
 }
 
 #[contracttype]
